@@ -1,5 +1,11 @@
 # A lightweight Xbox 360 plugin that recieves controller input from PC over the network.
 
+## BadAvatar / XeUnshackle status
+
+Confirmed working by Dreamy from Rigor Core on a BadAvatar / XeUnshackle setup over Ethernet.
+
+See [`docs/badavatar-xeunshackle-notes.md`](docs/badavatar-xeunshackle-notes.md) for the technical notes, root cause, working USB layout, and configuration details.
+
 ## 📜 Features
 - Send controller input to an Xbox 360 from PC over TCP.
 - Support for multiple controllers.

@@ -27,7 +27,8 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release Retail|Xbox 360'">
-    <IncludePath>.\xkelib;$(IncludePath)</IncludePath>
+    <IncludePath>.\xkelib;$(XEDK)\include\xbox;$(XEDK)\include\xbox\sys;$(XEDK)\include\win32;$(IncludePath)</IncludePath>
+    <LibraryPath>.\xkelib;$(XEDK)\lib\xbox;$(XEDK)\lib\win32;$(LibraryPath)</LibraryPath>
     <LinkIncremental>false</LinkIncremental>
     <PostBuildEventUseInBuild>false</PostBuildEventUseInBuild>
     <RemoteRoot>hdd:\Plugins</RemoteRoot>
@@ -36,7 +37,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release Retail|Xbox 360'">
     <ClCompile>
-      <AdditionalIncludeDirectories>..\xkelib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>.\xkelib;$(XEDK)\include\xbox;$(XEDK)\include\xbox\sys;$(XEDK)\include\win32;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release Retail|Xbox 360'">
@@ -62,8 +63,8 @@
       <WholeProgramOptimization>true</WholeProgramOptimization>
     </ClCompile>
     <Link>
-      <AdditionalLibraryDirectories>.\xkelib</AdditionalLibraryDirectories>
-      <AdditionalDependencies>xkelib.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>.\xkelib;$(XEDK)\lib\xbox;$(XEDK)\lib\win32</AdditionalLibraryDirectories>
+      <AdditionalDependencies>xkelib.lib;xboxkrnl.lib;xnet.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <OptimizeReferences>true</OptimizeReferences>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
@@ -83,7 +84,7 @@
       <DeploymentType>CopyToHardDrive</DeploymentType>
     </Deploy>
     <Deploy>
-      <ExcludedFromBuild>false</ExcludedFromBuild>
+      <ExcludedFromBuild>true</ExcludedFromBuild>
       <Progress>false</Progress>
       <ForceCopy>false</ForceCopy>
     </Deploy>

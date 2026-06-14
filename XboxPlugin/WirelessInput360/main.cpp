@@ -9,7 +9,10 @@
 #include "Detours.h"
 #include <winsockx.h>
 #include <sys/stat.h>
+#include <stdarg.h>
 #pragma comment(lib, "xnet.lib")
+
+#define WIRELESSINPUT360_NETDLL_VERSION 0x20352400
 
 // internal hard disk
 #define MOUNT_HDD "Hdd:"
@@ -63,8 +66,11 @@
 #define DEVICE_USBMU2 "\\Device\\Mass2PartitionFile\\Storage"
 
 PLDR_DATA_TABLE_ENTRY pDataTable = nullptr;
+HINSTANCE g_hModule = nullptr;
 char pluginPath[MAX_PATH];
-char ip[64] = "192.168.1.1";
+char pluginDir[MAX_PATH];
+char logPath[MAX_PATH];
+char ip[64] = "";
 int port = 3000;
 bool gotIp = false;
 
@@ -166,21 +172,114 @@ struct Controller {
 } __declspec(align(4));
 
 volatile int g_ClientThreadRunning = 1;
+bool g_HooksInstalled = false;
 
 Controller connectedControllers[4];
 
+void NormalizePath(char* pluginPath);
+
+HANDLE MakeThread(LPTHREAD_START_ROUTINE address, PVOID arg) {
+	HANDLE handle = 0;
+	ExCreateThread(
+		&handle,
+		0,
+		0,
+		XapiThreadStartup,
+		address,
+		arg,
+		EX_CREATE_FLAG_SUSPENDED | EX_CREATE_FLAG_SYSTEM | 0x18000424
+	);
+
+	if (handle) {
+		XSetThreadProcessor(handle, 4);
+		SetThreadPriority(handle, THREAD_PRIORITY_NORMAL);
+		ResumeThread(handle);
+	}
+
+	return handle;
+}
+
+void InitializePluginPaths(HINSTANCE hModule) {
+	strcpy(pluginDir, "Usb:\\");
+	strcpy(logPath, "Usb:\\WirelessInput360.log");
+	strcpy(pluginPath, "Usb:\\WirelessInput360.ini");
+
+	LDR_DATA_TABLE_ENTRY* moduleDataTable = reinterpret_cast<LDR_DATA_TABLE_ENTRY*>(hModule);
+
+	if (!moduleDataTable || !moduleDataTable->FullDllName.Buffer) {
+		return;
+	}
+
+	WideCharToMultiByte(CP_ACP, 0, moduleDataTable->FullDllName.Buffer, -1, pluginPath, MAX_PATH, nullptr, nullptr);
+
+	char* lastSlash = strrchr(pluginPath, '\\');
+	if (lastSlash) {
+		*(lastSlash + 1) = '\0';
+	}
+
+	NormalizePath(pluginPath);
+
+	strcpy(pluginDir, pluginPath);
+	strcpy(logPath, pluginDir);
+	strcat(logPath, "WirelessInput360.log");
+
+	strcat(pluginPath, "WirelessInput360.ini");
+}
+
+void WriteLogLine(const char* path, const char* message) {
+	if (!path || path[0] == '\0') {
+		return;
+	}
+
+	FILE* logFile = fopen(path, "a");
+	if (!logFile) {
+		return;
+	}
+
+	fputs(message, logFile);
+	fclose(logFile);
+}
+
+void LogMessage(const char* format, ...) {
+	char message[512];
+
+	va_list args;
+	va_start(args, format);
+	vsnprintf(message, sizeof(message), format, args);
+	va_end(args);
+
+	DbgPrint("%s", message);
+
+	WriteLogLine(logPath, message);
+	WriteLogLine("Usb:\\WirelessInput360.log", message);
+	WriteLogLine("Usb0:\\WirelessInput360.log", message);
+	WriteLogLine("Hdd:\\WirelessInput360.log", message);
+}
+
 void RemoveDevice(int controllerIndex) {
+	if (controllerIndex < 0 || controllerIndex >= 4 || !XamUserBindDeviceCallback) {
+		return;
+	}
+
 	connectedControllers[controllerIndex].ControllerStatus = INACTIVE;
 	XamUserBindDeviceCallback(0xa7553952 + controllerIndex, 0x0000000010000005 + controllerIndex, 0, true, 0);
 }
 
 void AddDevice(int controllerIndex) {
+	if (controllerIndex < 0 || controllerIndex >= 4 || !XamUserBindDeviceCallback) {
+		return;
+	}
+
 	Controller c = Controller();
-	c.ControllerStatus = ACTIVE;
 	c.packetNumber = 0;
 
 	uint8_t userIndex = -1;
 	XamUserBindDeviceCallback(0xa7553952 + controllerIndex, 0x0000000010000005 + controllerIndex, 0, false, &userIndex);
+	if (userIndex >= 4) {
+		return;
+	}
+
+	c.ControllerStatus = ACTIVE;
 	c.userIndex = userIndex;
 
 	connectedControllers[controllerIndex] = c;
@@ -221,8 +320,10 @@ DWORD XamInputGetStateHook(DWORD user, DWORD flags, XINPUT_STATE* input_state) {
 		if (!c)
 			return status;
 
+		memset(input_state, 0, sizeof(XINPUT_STATE));
+
 		// HUD is open.
-		if (XampInputRoutedToSysapp[c->userIndex]) {
+		if (XampInputRoutedToSysapp && c->userIndex < 4 && XampInputRoutedToSysapp[c->userIndex]) {
 			// 0x1 is used for titles, 0x0 is used by some offhosts and debug input.
 			if ((flags == 0x1) || (flags == 0x0)) {
 				return ERROR_SUCCESS;
@@ -329,10 +430,13 @@ DWORD XamInputGetCapabilitiesExHook(DWORD unk, DWORD user, DWORD flags, XINPUT_C
 		capabilities->Vibration.wRightMotorSpeed = 0;
 		return ERROR_SUCCESS;
 	}
+
+	return status;
 }
 
 void SendVibrationUpdate(int userIndex, unsigned short left, unsigned short right) {
 	if (g_ServerSocket == INVALID_SOCKET) return;
+	if (userIndex < 0 || userIndex >= 4) return;
 
 	// OPTIMIZATION: Only send if the values changed
 	if (g_LastVibration[userIndex].wLeftMotorSpeed == left &&
@@ -414,7 +518,10 @@ DWORD XamInputSetStateHook(DWORD user, DWORD flags, PXINPUT_VIBRATION pVibration
 		}
 		else {
 			// If pVibration is null, it usually implies stop (0,0)
-			SendVibrationUpdate(user & 0xFF, 0, 0);
+			int cleanIndex = user & 0xFF;
+			if (cleanIndex < 4) {
+				SendVibrationUpdate(cleanIndex, 0, 0);
+			}
 		}
 
 		return ERROR_SUCCESS;
@@ -440,9 +547,19 @@ bool ReadConfig()
 	if (gotIp) return true;
 
 	FILE* file = fopen(pluginPath, "r");
+	if (!file && strcmp(pluginPath, "Usb:\\WirelessInput360.ini") != 0) {
+		file = fopen("Usb:\\WirelessInput360.ini", "r");
+	}
+	if (!file && strcmp(pluginPath, "Usb0:\\WirelessInput360.ini") != 0) {
+		file = fopen("Usb0:\\WirelessInput360.ini", "r");
+	}
+	if (!file && strcmp(pluginPath, "Hdd:\\WirelessInput360.ini") != 0) {
+		file = fopen("Hdd:\\WirelessInput360.ini", "r");
+	}
+
 	if (!file)
 	{
-		OutputDebugStringA("Failed to open config file.\n");
+		LogMessage("[WirelessInput360] Failed to open config file: %s\n", pluginPath);
 		return false;
 	}
 
@@ -452,28 +569,44 @@ bool ReadConfig()
 	{
 		buffer[strcspn(buffer, "\r\n")] = 0;
 
-		if (strlen(buffer) == 0 || buffer[0] == '#')
+		char* line = buffer;
+		while (*line == ' ' || *line == '\t')
+			line++;
+
+		if (strlen(line) == 0 || line[0] == '#' || line[0] == ';' || line[0] == '[')
 			continue;
 
 		char lower[256];
-		strcpy(lower, buffer);
+		strcpy(lower, line);
 		for (char* p = lower; *p; ++p)
 			*p = (char)tolower(*p);
 
 		if (strncmp(lower, "ip=", 3) == 0)
 		{
-			strcpy(ip, buffer + 3);
+			strcpy(ip, line + 3);
 		}
 		else if (strncmp(lower, "port=", 5) == 0)
 		{
-			port = atoi(buffer + 5);
+			port = atoi(line + 5);
 		}
 	}
 
 	fclose(file);
 	gotIp = true;
+	LogMessage("[WirelessInput360] Loaded config. ip=%s port=%d\n", ip, port);
+
+	if (ip[0] == '\0') {
+		LogMessage("[WirelessInput360] Config is missing ip=\n");
+		return false;
+	}
 
 	return TRUE;
+}
+
+bool IsHexChar(char value) {
+	return (value >= '0' && value <= '9') ||
+		(value >= 'a' && value <= 'f') ||
+		(value >= 'A' && value <= 'F');
 }
 
 DWORD WINAPI StartWSConnection(LPVOID) {
@@ -482,19 +615,37 @@ DWORD WINAPI StartWSConnection(LPVOID) {
     xnsp.cfgSizeOfStruct = sizeof(XNetStartupParams);
     xnsp.cfgFlags = XNET_STARTUP_BYPASS_SECURITY;
 
-    // 1. MOVED UP: Initialize Network Stack ONCE
-    // Note: It is safer to use NetDll_WSAStartup with the SYSAPP caller ID 
-    // to match your other NetDll calls, but standard WSAStartup often maps similarly.
+    int xnetResult = NetDll_XNetStartupEx(
+        static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP),
+        &xnsp,
+        WIRELESSINPUT360_NETDLL_VERSION
+    );
+
+    if (xnetResult != 0) {
+        LogMessage("[WirelessInput360] CRITICAL: NetDll_XNetStartupEx failed: %d\n", xnetResult);
+        return 0;
+    }
+
     WSADATA wsaData;
-    int wsaResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    int wsaResult = NetDll_WSAStartupEx(
+        static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP),
+        2,
+        &wsaData,
+        WIRELESSINPUT360_NETDLL_VERSION
+    );
     
     if (wsaResult != 0) {
-        DbgPrint("[WirelessInput360] CRITICAL: WSAStartup failed: %d\n", wsaResult);
+        LogMessage("[WirelessInput360] CRITICAL: NetDll_WSAStartupEx failed: %d\n", wsaResult);
+        NetDll_XNetCleanup(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP));
         return 0; // Cannot run without network stack
     }
 
+    DWORD linkStatus = NetDll_XNetGetEthernetLinkStatus(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP));
+    LogMessage("[WirelessInput360] XNet initialized. Ethernet link status: 0x%08X\n", linkStatus);
+
     // 2. Check config once (or move inside if config changes dynamically)
     if (!ReadConfig()) {
+        NetDll_XNetCleanup(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP));
         NetDll_WSACleanup(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP));
         return 0;
     }
@@ -505,7 +656,7 @@ DWORD WINAPI StartWSConnection(LPVOID) {
         // Create Socket
         SOCKET sock = NetDll_socket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (sock == INVALID_SOCKET) {
-            DbgPrint("[WirelessInput360] socket creation failed: %d\n", NetDll_WSAGetLastError());
+            LogMessage("[WirelessInput360] socket creation failed: %d\n", NetDll_WSAGetLastError());
             // Do NOT Cleanup WSA here, just sleep and retry the socket creation
             Sleep(3000);
             continue;
@@ -520,13 +671,20 @@ DWORD WINAPI StartWSConnection(LPVOID) {
         target.sin_port = htons(port);
         target.sin_addr.s_addr = inet_addr(ip);
 
+        LogMessage("[WirelessInput360] Attempting connect to %s:%d\n", ip, port);
+
         if (NetDll_connect(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock, (SOCKADDR*)&target, sizeof(target)) == SOCKET_ERROR) {
-            DbgPrint("[WirelessInput360] connect failed. Retrying in 3s...\n");
+            LogMessage(
+                "[WirelessInput360] connect failed to %s:%d. wsa=%d. Retrying in 3s...\n",
+                ip,
+                port,
+                NetDll_WSAGetLastError()
+            );
             NetDll_closesocket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock);
             Sleep(3000);
             continue;
         }
-        DbgPrint("[WirelessInput360] Connected to server\n");
+        LogMessage("[WirelessInput360] Connected to server\n");
 
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
@@ -543,7 +701,7 @@ DWORD WINAPI StartWSConnection(LPVOID) {
         );
 
         if (NetDll_send(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock, wsHandshake, strlen(wsHandshake), 0) == SOCKET_ERROR) {
-            DbgPrint("[WirelessInput360] Handshake send failed\n");
+            LogMessage("[WirelessInput360] Handshake send failed. wsa=%d\n", NetDll_WSAGetLastError());
             NetDll_closesocket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock);
             Sleep(3000);
             continue;
@@ -554,13 +712,13 @@ DWORD WINAPI StartWSConnection(LPVOID) {
         int bytes = NetDll_recv(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock, buf, BUFSIZE - 1, 0);
 
         if (bytes <= 0) {
-            DbgPrint("[WirelessInput360] Handshake recv failed / server closed\n");
+            LogMessage("[WirelessInput360] Handshake recv failed / server closed. wsa=%d\n", NetDll_WSAGetLastError());
             NetDll_closesocket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock);
             Sleep(3000);
             continue;
         }
         // ... Handshake processing ...
-        DbgPrint("[WirelessInput360] Handshake response received\n");
+        LogMessage("[WirelessInput360] Handshake response received\n");
 
 		g_ServerSocket = sock;
 
@@ -588,14 +746,24 @@ DWORD WINAPI StartWSConnection(LPVOID) {
 				}
 
 				if (masked) {
+					if ((offset + 4) > bytes) {
+						continue;
+					}
+
 					unsigned char mask[4];
 					memcpy(mask, data + offset, 4);
 					offset += 4;
+
+					if ((offset + payloadLen) > bytes) {
+						continue;
+					}
+
 					for (int i = 0; i < payloadLen; ++i)
 						data[offset + i] ^= mask[i % 4];
 				}
-
-				static char prevText[256] = { 0 };
+				else if ((offset + payloadLen) > bytes) {
+					continue;
+				}
 
 				// Print text frames only
 				if (opcode == 1) {
@@ -605,8 +773,16 @@ DWORD WINAPI StartWSConnection(LPVOID) {
 					text[payloadLen] = '\0';
 
 					if (text[0] != '\0') {
+						if (payloadLen < 2 || (text[0] != '0' && text[0] != '1') || text[1] < '0' || text[1] > '3') {
+							continue;
+						}
+
 						int pStatus = text[0] - '0'; // State
 						int pNum = text[1] - '0';
+
+						if (pNum < 0 || pNum >= 4) {
+							continue;
+						}
 
 						if (pStatus == 1) {
 							if (connectedControllers[pNum].ControllerStatus == ACTIVE) {
@@ -623,11 +799,26 @@ DWORD WINAPI StartWSConnection(LPVOID) {
 						int raw_len = 0;
 
 						for (int i = 0; text[i] && text[i + 1]; i += 2) {
+							if (!IsHexChar(text[i]) || !IsHexChar(text[i + 1])) {
+								raw_len = 0;
+								break;
+							}
+
 							char buf[3] = { text[i], text[i + 1], 0 }; // take 2 chars + null
 							raw[raw_len++] = (uint8_t)strtol(buf, NULL, 16);
 						}
 
-						ButtonsReport buttonReport = *(ButtonsReport*)raw;
+						if (raw_len < 10) {
+							continue;
+						}
+
+						ButtonsReport buttonReport;
+						memset(&buttonReport, 0, sizeof(buttonReport));
+						int copyLen = raw_len;
+						if (copyLen > (int)sizeof(buttonReport)) {
+							copyLen = sizeof(buttonReport);
+						}
+						memcpy(&buttonReport, raw, copyLen);
 
 						connectedControllers[pNum].currentState = buttonReport;
 					}
@@ -646,9 +837,10 @@ DWORD WINAPI StartWSConnection(LPVOID) {
 
 		// Close the socket, but keep WSA loaded for the next attempt
 		NetDll_closesocket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), sock);
-		DbgPrint("[WirelessInput360] Connection lost. Retrying in 3s...\n");
+		LogMessage("[WirelessInput360] Connection lost. Retrying in 3s...\n");
 		Sleep(3000);
 	}
+	NetDll_XNetCleanup(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP));
 	NetDll_WSACleanup(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP));
 	return 0;
 }
@@ -663,25 +855,33 @@ bool initFunctionPointers() {
 	HANDLE kernelHandle = GetModuleHandleA("xboxkrnl.exe");
 
 	if (!kernelHandle) {
-		DbgPrint("[WirelessInput360] COULDNT GET KERNEL HANDLE!\n");
+		LogMessage("[WirelessInput360] COULDNT GET KERNEL HANDLE!\n");
 		return false;
 	}
 
 	HANDLE xamHandle = GetModuleHandleA("xam.xex");
+	if (!xamHandle) {
+		LogMessage("[WirelessInput360] COULDNT GET XAM HANDLE!\n");
+		return false;
+	}
 
 	XexGetProcedureAddress(kernelHandle, 189, &MmFreePhysicalMemory);
 
 	XexGetProcedureAddress(xamHandle, 685, &XamInputGetCapabilitiesEx);
 	XexGetProcedureAddress(xamHandle, 401, &XamInputGetState);
 	XexGetProcedureAddress(xamHandle, 402, &XamInputSetState);
+	if (!XamInputGetCapabilitiesEx || !XamInputGetState || !XamInputSetState) {
+		LogMessage("[WirelessInput360] Failed to resolve XInput exports\n");
+		return false;
+	}
 
 	if (isDevkit) {
-		DbgPrint("[WirelessInput360] Running in devkit mode\n");
+		LogMessage("[WirelessInput360] Running in devkit mode\n");
 		XamUserBindDeviceCallback = (xam_user_bind_device_callback_func_t)0x817A34B8; // 7C 8B 23 78 7C A4 2B 78 54 CA 06 3F
 		XampInputRoutedToSysapp = (DWORD*)0x81D4F650;
 	}
 	else {
-		DbgPrint("[WirelessInput360] Running in retail mode\n");
+		LogMessage("[WirelessInput360] Running in retail mode\n");
 		XamUserBindDeviceCallback = (xam_user_bind_device_callback_func_t)0x816D9060; // 7C 8B 23 78 7C A4 2B 78 54 CA 06 3F
 		XampInputRoutedToSysapp = (DWORD*)0x81AAC2A0;
 	}
@@ -751,57 +951,59 @@ void NormalizePath(char* pluginPath)
 	}
 }
 
+DWORD WINAPI BootstrapThread(LPVOID)
+{
+	Sleep(8000);
+
+	InitializePluginPaths(g_hModule);
+	LogMessage("[WirelessInput360] Bootstrap entered\n");
+	LogMessage("[WirelessInput360] Plugin directory: %s\n", pluginDir);
+	LogMessage("[WirelessInput360] Config path: %s\n", pluginPath);
+
+	if ((XboxKrnlVersion->Build != 17559 && XboxKrnlVersion->Build != 17489) || IsTrayOpen()) {
+		LogMessage("[WirelessInput360] Only 17559 and 17489 dashboards are currently supported or the disk tray is open. Aborting launch...\n");
+		return 0;
+	}
+
+	if (!initFunctionPointers())
+		return 0;
+
+	if (isDevkit) {
+		XamInactivityDetectRecentActivityDetour = Detour((void*)0x81750588, (void*)XamInactivityDetectRecentActivityHook); // 3D 60 81 ?? 3D 40 81 ?? E8 6B ?? ?? E9 6A ?? ?? 7F 23 58 40 40 98 00 0C
+	}
+	else {
+		XamInactivityDetectRecentActivityDetour = Detour((void*)0x81695DE8, (void*)XamInactivityDetectRecentActivityHook); // 3D 60 81 ?? 3D 40 81 ?? E8 6B ?? ?? E9 6A ?? ?? 7F 23 58 40 40 98 00 0C
+	}
+
+	XamInputGetStateDetour = Detour(XamInputGetState, (void*)XamInputGetStateHook);
+	XamInputGetCapabilitiesDetour = Detour(XamInputGetCapabilitiesEx, (void*)XamInputGetCapabilitiesExHook);
+	XamInputSetStateDetour = Detour(XamInputSetState, (void*)XamInputSetStateHook);
+
+	XamInputGetStateDetour.Install();
+	XamInputGetCapabilitiesDetour.Install();
+	XamInputSetStateDetour.Install();
+	XamInactivityDetectRecentActivityDetour.Install();
+
+	g_HooksInstalled = true;
+	LogMessage("[WirelessInput360] Hooks installed\n");
+
+	return StartWSConnection(nullptr);
+}
+
 BOOL DllMain(HINSTANCE hModule, DWORD reason, void* pReserved)
 {
 	if (reason == DLL_PROCESS_ATTACH)
 	{
-		if ((XboxKrnlVersion->Build != 17559 && XboxKrnlVersion->Build != 17489) || IsTrayOpen()) {
-			DbgPrint("[WirelessInput360] Only 17559 and 17489 dashboards are currently supported or the disk tray is open. Aborting launch...\n");
-			return FALSE;
-		}
-
-		if (!initFunctionPointers())
-			return FALSE;
-
-		if (isDevkit) {
-			XamInactivityDetectRecentActivityDetour = Detour((void*)0x81750588, (void*)XamInactivityDetectRecentActivityHook); // 3D 60 81 ?? 3D 40 81 ?? E8 6B ?? ?? E9 6A ?? ?? 7F 23 58 40 40 98 00 0C
-		}
-		else {
-			XamInactivityDetectRecentActivityDetour = Detour((void*)0x81695DE8, (void*)XamInactivityDetectRecentActivityHook); // 3D 60 81 ?? 3D 40 81 ?? E8 6B ?? ?? E9 6A ?? ?? 7F 23 58 40 40 98 00 0C
-		}
-
-		LDR_DATA_TABLE_ENTRY* pDataTable = reinterpret_cast<LDR_DATA_TABLE_ENTRY*>(hModule);
-
-		WideCharToMultiByte(CP_ACP, 0, pDataTable->FullDllName.Buffer, -1, pluginPath, MAX_PATH, nullptr, nullptr);
-
-		char* lastSlash = strrchr(pluginPath, '\\');
-		if (lastSlash)
-		{
-			*(lastSlash + 1) = '\0';
-		}
-
-		NormalizePath(pluginPath);
-
-		strcat(pluginPath, "WirelessInput360.ini");
-
-		XamInputGetStateDetour = Detour(XamInputGetState, (void*)XamInputGetStateHook);
-		XamInputGetCapabilitiesDetour = Detour(XamInputGetCapabilitiesEx, (void*)XamInputGetCapabilitiesExHook);
-		XamInputSetStateDetour = Detour(XamInputSetState, (void*)XamInputSetStateHook);
-
-		XamInputGetStateDetour.Install();
-		XamInputGetCapabilitiesDetour.Install();
-		XamInputSetStateDetour.Install();
-		XamInactivityDetectRecentActivityDetour.Install();
-
-		DbgPrint("[WirelessInput360] Hooks installed\n");
-
-		ExCreateThread(nullptr, 0, nullptr, nullptr, StartWSConnection, nullptr, 2);
+		g_hModule = hModule;
+		MakeThread(BootstrapThread, nullptr);
 	}
 	else if (reason == DLL_PROCESS_DETACH) {
-		XamInputGetStateDetour.Remove();
-		XamInputGetCapabilitiesDetour.Remove();
-		XamInputSetStateDetour.Remove();
-		XamInactivityDetectRecentActivityDetour.Remove();
+		if (g_HooksInstalled) {
+			XamInputGetStateDetour.Remove();
+			XamInputGetCapabilitiesDetour.Remove();
+			XamInputSetStateDetour.Remove();
+			XamInactivityDetectRecentActivityDetour.Remove();
+		}
 
 		port = 3000;
 		gotIp = false;

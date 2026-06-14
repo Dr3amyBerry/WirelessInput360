@@ -418,6 +418,10 @@ FodyWeavers.xsd
 *.msm
 *.msp
 XboxPlugin/WirelessInput360/Release RetailWirelessInput360.xdb
+XboxPlugin/WirelessInput360/Release RetailWirelessInput360.pdb
 XboxPlugin/WirelessInput360/Release Retail/WirelessInput360.xex
 XboxPlugin/WirelessInput360/Release Retail/WirelessInput360.lastbuildstate
 XboxPlugin/WirelessInput360/Release Retail/WirelessInput360.exe
+XboxPlugin/WirelessInput360/Release Retail/
+XboxPlugin/WirelessInput360/build/
+XboxPlugin/WirelessInput360/xextool.exe
