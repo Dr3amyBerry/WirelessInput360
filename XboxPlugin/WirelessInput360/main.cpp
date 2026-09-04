@@ -70,6 +70,8 @@ HINSTANCE g_hModule = nullptr;
 char pluginPath[MAX_PATH];
 char pluginDir[MAX_PATH];
 char logPath[MAX_PATH];
+// Un-normalized NT device path to the ini, e.g. \Device\Mass0\WirelessInput360.ini
+char rawIniPath[MAX_PATH] = "";
 char ip[64] = "";
 int port = 3000;
 bool gotIp = false;
@@ -182,7 +184,8 @@ HANDLE MakeThread(LPTHREAD_START_ROUTINE address, PVOID arg) {
 	HANDLE handle = 0;
 	ExCreateThread(
 		&handle,
-		0,
+		0x10000,   // 64 KB de pila. Con 0 el hilo recibe la minima, y
+		           // ReadConfig usa 512 bytes de locales mas el stdio
 		0,
 		XapiThreadStartup,
 		address,
@@ -217,6 +220,9 @@ void InitializePluginPaths(HINSTANCE hModule) {
 		*(lastSlash + 1) = '\0';
 	}
 
+	strcpy(rawIniPath, pluginPath);
+	strcat(rawIniPath, "WirelessInput360.ini");
+
 	NormalizePath(pluginPath);
 
 	strcpy(pluginDir, pluginPath);
@@ -224,6 +230,62 @@ void InitializePluginPaths(HINSTANCE hModule) {
 	strcat(logPath, "WirelessInput360.log");
 
 	strcat(pluginPath, "WirelessInput360.ini");
+}
+
+// UDP log channel.
+//
+// Why UDP: it is connectionless, so it needs no successful connect() and no
+// server to accept anything. It therefore still reports even when the TCP
+// connection to the controller server is exactly what is failing.
+//
+// Why broadcast: it does not depend on having read the ini, so a config failure
+// still gets reported. Any machine on the link can listen.
+//
+// Why not the alternatives: file logging has never worked from this plugin, and
+// every XAM UI call (XNotifyQueueUI, XShowMessageBoxUI) kills Aurora.
+#define WI360_LOG_PORT 3001
+
+SOCKET g_LogSocket = INVALID_SOCKET;
+
+void InitNetLog() {
+	if (g_LogSocket != INVALID_SOCKET) {
+		return;
+	}
+
+	g_LogSocket = NetDll_socket(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (g_LogSocket == INVALID_SOCKET) {
+		return;
+	}
+
+	// Same option the TCP path already sets: tells the Xbox network stack this
+	// peer is not a secure Xbox Live endpoint, otherwise traffic is dropped.
+	BOOL opt_true = TRUE;
+	NetDll_setsockopt(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), g_LogSocket, SOL_SOCKET, 0x5801, (PCSTR)&opt_true, sizeof(BOOL));
+
+	BOOL bcast = TRUE;
+	NetDll_setsockopt(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP), g_LogSocket, SOL_SOCKET, SO_BROADCAST, (PCSTR)&bcast, sizeof(BOOL));
+}
+
+void NetLog(const char* message) {
+	if (g_LogSocket == INVALID_SOCKET || !message) {
+		return;
+	}
+
+	SOCKADDR_IN dest;
+	memset(&dest, 0, sizeof(dest));
+	dest.sin_family = AF_INET;
+	dest.sin_port = htons(WI360_LOG_PORT);
+	dest.sin_addr.s_addr = INADDR_BROADCAST;
+
+	NetDll_sendto(
+		static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP),
+		g_LogSocket,
+		message,
+		(int)strlen(message),
+		0,
+		(SOCKADDR*)&dest,
+		sizeof(dest)
+	);
 }
 
 void WriteLogLine(const char* path, const char* message) {
@@ -249,6 +311,8 @@ void LogMessage(const char* format, ...) {
 	va_end(args);
 
 	DbgPrint("%s", message);
+
+	NetLog(message);
 
 	WriteLogLine(logPath, message);
 	WriteLogLine("Usb:\\WirelessInput360.log", message);
@@ -541,49 +605,194 @@ int XamInactivityDetectRecentActivityHook(DWORD r3) {
 	}
 	return XamInactivityDetectRecentActivityDetour.GetOriginal<decltype(&XamInactivityDetectRecentActivityHook)>()(r3);
 }
+// Native NT file read.
+//
+// Win32 CreateFileA resolves paths through the \??\ DOS device namespace, so it
+// cannot open a raw NT object path like \Device\Mass0\file. The UDP probes proved
+// that: every Win32 candidate failed, including the raw device path.
+//
+// NtOpenFile takes an OBJECT_ATTRIBUTES with a native name, so it addresses the
+// device object directly and needs no mount alias to exist in this process.
+#ifndef OBJ_CASE_INSENSITIVE
+#define OBJ_CASE_INSENSITIVE 0x00000040
+#endif
+#ifndef FILE_SYNCHRONOUS_IO_NONALERT
+#define FILE_SYNCHRONOUS_IO_NONALERT 0x00000020
+#endif
+#ifndef FILE_NON_DIRECTORY_FILE
+#define FILE_NON_DIRECTORY_FILE 0x00000040
+#endif
+
+DWORD ReadWholeFileNt(const char* ntPath, char* out, DWORD outSize) {
+	if (!ntPath || ntPath[0] == '\0' || !out || outSize == 0) {
+		return 0;
+	}
+
+	OBJECT_STRING name;
+	name.Buffer = (PCHAR)ntPath;
+	name.Length = (USHORT)strlen(ntPath);
+	name.MaximumLength = (USHORT)(name.Length + 1);
+
+	OBJECT_ATTRIBUTES oa;
+	InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL);
+
+	HANDLE h = NULL;
+	IO_STATUS_BLOCK iosb;
+	memset(&iosb, 0, sizeof(iosb));
+
+	NTSTATUS st = NtOpenFile(
+		&h,
+		GENERIC_READ | SYNCHRONIZE,
+		&oa,
+		&iosb,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE
+	);
+
+	if (st < 0 || h == NULL) {
+		return 0;
+	}
+
+	LARGE_INTEGER offset;
+	offset.QuadPart = 0;
+	memset(&iosb, 0, sizeof(iosb));
+
+	st = NtReadFile(h, NULL, NULL, NULL, &iosb, out, outSize - 1, &offset);
+
+	NtClose(h);
+
+	if (st < 0) {
+		return 0;
+	}
+
+	DWORD read = (DWORD)iosb.Information;
+	if (read >= outSize) {
+		read = outSize - 1;
+	}
+	out[read] = '\0';
+	return read;
+}
+
+
+// Reads a whole small file with raw Win32.
+//
+// CRT fopen() fails on this console for every mount alias the plugin knows about
+// (Usb:, Usb0:, Hdd:) -- proven by the UDP probes: "about to fopen Usb0:\..."
+// followed by "Failed to open config file". Those aliases are created per process
+// by whoever needs them (Aurora mounts its own), and the dashboard process this
+// plugin lives in does not necessarily have them.
+//
+// The raw NT device path from FullDllName needs no alias at all, so it is tried
+// first. CreateFileA also lets us pass an explicit share mode.
+//
+// Returns bytes read, or 0 on failure. Always null terminates.
+DWORD ReadWholeFile(const char* path, char* out, DWORD outSize) {
+	if (!path || path[0] == '\0' || !out || outSize == 0) {
+		return 0;
+	}
+
+	HANDLE h = CreateFileA(
+		path,
+		GENERIC_READ,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		nullptr,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr
+	);
+
+	if (h == INVALID_HANDLE_VALUE) {
+		return 0;
+	}
+
+	DWORD read = 0;
+	BOOL ok = ReadFile(h, out, outSize - 1, &read, nullptr);
+	CloseHandle(h);
+
+	if (!ok) {
+		return 0;
+	}
+
+	out[read] = '\0';
+	return read;
+}
 
 bool ReadConfig()
 {
 	if (gotIp) return true;
 
-	FILE* file = fopen(pluginPath, "r");
-	if (!file && strcmp(pluginPath, "Usb:\\WirelessInput360.ini") != 0) {
-		file = fopen("Usb:\\WirelessInput360.ini", "r");
-	}
-	if (!file && strcmp(pluginPath, "Usb0:\\WirelessInput360.ini") != 0) {
-		file = fopen("Usb0:\\WirelessInput360.ini", "r");
-	}
-	if (!file && strcmp(pluginPath, "Hdd:\\WirelessInput360.ini") != 0) {
-		file = fopen("Hdd:\\WirelessInput360.ini", "r");
+	// Candidates, most likely to work first. rawIniPath is the un-normalized NT
+	// device path (e.g. \Device\Mass0\WirelessInput360.ini) and needs no mount.
+	const char* candidates[5] = {
+		rawIniPath,
+		pluginPath,
+		"Usb:\\WirelessInput360.ini",
+		"Usb0:\\WirelessInput360.ini",
+		"Hdd:\\WirelessInput360.ini"
+	};
+
+	static char contents[2048];
+	DWORD len = 0;
+	const char* usedPath = nullptr;
+
+	for (int i = 0; i < 5; i++) {
+		if (!candidates[i] || candidates[i][0] == '\0') {
+			continue;
+		}
+
+		LogMessage("[WirelessInput360] probe: trying %s\n", candidates[i]);
+
+			// Native first: it is the only call that can open a raw \Device\ path.
+			len = ReadWholeFileNt(candidates[i], contents, sizeof(contents));
+			if (len == 0) {
+				len = ReadWholeFile(candidates[i], contents, sizeof(contents));
+			}
+		if (len > 0) {
+			usedPath = candidates[i];
+			break;
+		}
 	}
 
-	if (!file)
+	if (!usedPath)
 	{
-		LogMessage("[WirelessInput360] Failed to open config file: %s\n", pluginPath);
+		LogMessage("[WirelessInput360] Failed to open config from any path\n");
 		return false;
 	}
 
-	char buffer[256];
+	LogMessage("[WirelessInput360] Config read from %s (%d bytes)\n", usedPath, (int)len);
 
-	while (fgets(buffer, sizeof(buffer), file))
+	// Parse in memory, one line at a time.
+	char* cursor = contents;
+	while (*cursor)
 	{
-		buffer[strcspn(buffer, "\r\n")] = 0;
+		char* line = cursor;
 
-		char* line = buffer;
+		char* eol = strpbrk(cursor, "\r\n");
+		if (eol) {
+			*eol = '\0';
+			cursor = eol + 1;
+			while (*cursor == '\r' || *cursor == '\n') cursor++;
+		}
+		else {
+			cursor += strlen(cursor);
+		}
+
 		while (*line == ' ' || *line == '\t')
 			line++;
 
 		if (strlen(line) == 0 || line[0] == '#' || line[0] == ';' || line[0] == '[')
 			continue;
 
-		char lower[256];
-		strcpy(lower, line);
+		static char lower[256];
+		strncpy(lower, line, sizeof(lower) - 1);
+		lower[sizeof(lower) - 1] = '\0';
 		for (char* p = lower; *p; ++p)
 			*p = (char)tolower(*p);
 
 		if (strncmp(lower, "ip=", 3) == 0)
 		{
-			strcpy(ip, line + 3);
+			strncpy(ip, line + 3, sizeof(ip) - 1);
+			ip[sizeof(ip) - 1] = '\0';
 		}
 		else if (strncmp(lower, "port=", 5) == 0)
 		{
@@ -591,7 +800,6 @@ bool ReadConfig()
 		}
 	}
 
-	fclose(file);
 	gotIp = true;
 	LogMessage("[WirelessInput360] Loaded config. ip=%s port=%d\n", ip, port);
 
@@ -640,8 +848,12 @@ DWORD WINAPI StartWSConnection(LPVOID) {
         return 0; // Cannot run without network stack
     }
 
+    InitNetLog();
+
     DWORD linkStatus = NetDll_XNetGetEthernetLinkStatus(static_cast<XNCALLER_TYPE>(XNCALLER_SYSAPP));
     LogMessage("[WirelessInput360] XNet initialized. Ethernet link status: 0x%08X\n", linkStatus);
+
+    LogMessage("[WirelessInput360] probe: entering ReadConfig\n");
 
     // 2. Check config once (or move inside if config changes dynamically)
     if (!ReadConfig()) {

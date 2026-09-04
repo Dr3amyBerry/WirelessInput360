@@ -425,3 +425,10 @@ XboxPlugin/WirelessInput360/Release Retail/WirelessInput360.exe
 XboxPlugin/WirelessInput360/Release Retail/
 XboxPlugin/WirelessInput360/build/
 XboxPlugin/WirelessInput360/xextool.exe
+
+# Local debugging helpers, not part of any build
+tools/laptop/
+tools/*.patch
+tools/wi360logger/*.exe
+tools/wi360logger/*.obj
+tools/wi360logger/wi360.log

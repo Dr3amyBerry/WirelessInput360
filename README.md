@@ -19,6 +19,55 @@ Confirmed working by Dreamy from Rigor Core over Ethernet.
 - Disabled automatic XDK deploy during build so local MSBuild can generate the XEX without requiring a configured devkit target.
 - Documented the BadAvatar / XeUnshackle setup and root cause in `docs/badavatar-xeunshackle-notes.md`.
 
+## Config loading fix
+
+The plugin could reach the network stage and then stop, never connecting. The
+cause was reading `WirelessInput360.ini`.
+
+A DashLaunch plugin runs inside the dashboard process. The `Usb:` / `Usb0:` /
+`Hdd:` mount aliases are **not** guaranteed to exist there -- each application
+creates the ones it needs, which is why Aurora's own log shows it mounting
+`\??\Usb0: -> \Device\Mass0` for itself at startup. Every `fopen` against those
+aliases failed, `ReadConfig` returned false, and the plugin gave up before it ever
+called `connect`.
+
+The un-normalized NT path from `FullDllName` (`\Device\Mass0\...`) does not help
+with Win32 either: `CreateFileA` resolves names through the `\??\` DOS device
+namespace and cannot open a native object path.
+
+The fix is to open the file with the native API, which addresses the device object
+directly and needs no alias:
+
+```c
+OBJECT_STRING name = { len, len + 1, (PCHAR)ntPath };
+OBJECT_ATTRIBUTES oa;
+InitializeObjectAttributes(&oa, &name, OBJ_CASE_INSENSITIVE, NULL);
+NtOpenFile(&h, GENERIC_READ | SYNCHRONIZE, &oa, &iosb,
+           FILE_SHARE_READ | FILE_SHARE_WRITE,
+           FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE);
+```
+
+`ReadConfig` now tries the raw device path first, falls back to the aliases, and
+parses in memory instead of using `fgets`.
+
+Related fixes in the same area:
+
+- The bootstrap thread was created with a stack size of `0`. `ReadConfig` used 512
+  bytes of stack locals plus CRT stdio on top, which was enough to overflow it and
+  take the console down. The thread now gets an explicit 64 KB stack and the
+  parser buffers are static.
+- Log output is sent over UDP instead of written to a file. See
+  `tools/wi360logger/`.
+
+## Log output
+
+File logging never worked from this plugin, for the same reason config loading did
+not. Log lines are now broadcast as UDP datagrams on port 3001.
+
+Run `tools/wi360logger/wi360logger.exe` on the PC before powering on the console
+to watch them live. It needs no runtime or redistributable. See
+`tools/wi360logger/README.md`.
+
 ## Requirements
 
 - Xbox 360 running dashboard 17559 or 17489.
